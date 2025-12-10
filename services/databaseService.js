@@ -181,13 +181,11 @@ class DatabaseService {
       SELECT
           vls.campaign_id,
           COUNT(*) as total,
-          CAST(SUM(CASE WHEN vl.status IN ('PU', 'PM', 'SVYEXT', 'SALE', 'DNC', 'NI', 'DC', 'ADC', 'SVYHU', 'SVYVM')
-              THEN 1 ELSE 0 END) AS UNSIGNED) as avance,
-          ROUND((SUM(CASE WHEN vl.status IN ('PU', 'PM', 'SVYEXT', 'SALE', 'DNC', 'NI', 'DC', 'ADC', 'SVYHU', 'SVYVM')
-              THEN 1 ELSE 0 END) / COUNT(*)) * 100, 2) as porcentaje
+          CAST(SUM(CASE WHEN vl.called_count > 0 THEN 1 ELSE 0 END) AS UNSIGNED) as avance,
+          ROUND((SUM(CASE WHEN vl.called_count > 0 THEN 1 ELSE 0 END) / COUNT(*)) * 100, 2) as porcentaje
       FROM vicidial_list vl
       INNER JOIN vicidial_lists vls ON vl.list_id = vls.list_id
-      WHERE vls.campaign_id = ?
+      WHERE vls.campaign_id = ? AND vls.active = 'Y'
       GROUP BY vls.campaign_id
       LIMIT ?
     `;
@@ -206,14 +204,35 @@ class DatabaseService {
         (SELECT COUNT(*) FROM vicidial_live_agents WHERE status != 'LOGOUT') as active_agents,
         (SELECT COUNT(*) FROM vicidial_auto_calls WHERE status = 'LIVE') as active_calls,
         (SELECT COUNT(DISTINCT campaign_id) FROM vicidial_campaigns WHERE active = 'Y') as active_campaigns,
-        (SELECT COUNT(*) FROM vicidial_list WHERE status = 'NEW') as available_leads,
+        (SELECT COUNT(*)
+         FROM vicidial_list vl
+         INNER JOIN vicidial_lists vls ON vl.list_id = vls.list_id
+         WHERE vls.active = 'Y' AND (vl.called_count = 0 OR vl.called_count IS NULL)
+        ) as pending_leads,
         (SELECT COUNT(*) FROM vicidial_log WHERE call_date >= CURDATE()) as calls_today,
         (SELECT COUNT(*) FROM vicidial_log WHERE status = 'SALE' AND call_date >= CURDATE()) as sales_today,
-        (SELECT AVG(length_in_sec) FROM vicidial_log WHERE call_date >= CURDATE() AND length_in_sec > 0) as avg_talk_time_today
+        (SELECT AVG(length_in_sec) FROM vicidial_log WHERE call_date >= CURDATE() AND length_in_sec > 0) as avg_talk_time_today,
+        (SELECT COUNT(*)
+         FROM vicidial_list vl
+         INNER JOIN vicidial_lists vls ON vl.list_id = vls.list_id
+         WHERE vls.active = 'Y'
+        ) as total_leads_active_lists
     `;
 
     const results = await database.query(sql);
-    return results[0] || {};
+    const stats = results[0] || {};
+
+    // Calculate conversion rate
+    stats.conversion_rate = stats.calls_today > 0
+      ? ((stats.sales_today / stats.calls_today) * 100).toFixed(2)
+      : 0;
+
+    // Calculate calls per agent
+    stats.calls_per_agent = stats.active_agents > 0
+      ? Math.round(stats.calls_today / stats.active_agents)
+      : 0;
+
+    return stats;
   }
 
   /**
@@ -357,18 +376,26 @@ class DatabaseService {
   async getListsByCampaign(campaignId) {
     const sql = `
       SELECT
-        list_id,
-        list_name,
-        campaign_id,
-        active,
-        list_description,
-        list_changedate,
-        list_lastcalldate,
-        reset_time,
-        expiration_date
-      FROM vicidial_lists
-      WHERE campaign_id = ?
-      ORDER BY list_id DESC
+        vls.list_id,
+        vls.list_name,
+        vls.campaign_id,
+        vls.active,
+        vls.list_description,
+        vls.list_changedate,
+        vls.list_lastcalldate,
+        vls.reset_time,
+        vls.expiration_date,
+        COUNT(DISTINCT vl.lead_id) as total_leads,
+        SUM(CASE WHEN vl.called_count = 0 OR vl.called_count IS NULL THEN 1 ELSE 0 END) as leads_new,
+        SUM(CASE WHEN vl.called_count > 0 THEN 1 ELSE 0 END) as leads_contacted,
+        SUM(CASE WHEN vl.status = 'DNC' THEN 1 ELSE 0 END) as leads_dnc
+      FROM vicidial_lists vls
+      LEFT JOIN vicidial_list vl ON vls.list_id = vl.list_id
+      WHERE vls.campaign_id = ?
+      GROUP BY vls.list_id, vls.list_name, vls.campaign_id, vls.active,
+               vls.list_description, vls.list_changedate, vls.list_lastcalldate,
+               vls.reset_time, vls.expiration_date
+      ORDER BY vls.list_id DESC
     `;
 
     return await database.query(sql, [campaignId]);

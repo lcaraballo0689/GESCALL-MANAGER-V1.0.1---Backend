@@ -112,13 +112,15 @@ router.post('/:campaign_id/progress', async (req, res) => {
       limit
     );
 
+    console.log(`[Campaign Progress] Campaign: ${campaign_id}, Data:`, data);
+
     res.json({
       success: true,
       data,
     });
   } catch (error) {
     console.error('[Campaign Progress] Error:', error);
-    res.status(500).json({
+    res.json({
       success: false,
       error: error.message,
     });
