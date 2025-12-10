@@ -14,14 +14,37 @@ const leadsRoutes = require('./routes/leads');
 const campaignsRoutes = require('./routes/campaigns');
 const agentsRoutes = require('./routes/agents');
 const dashboardRoutes = require('./routes/dashboard');
+const audioRoutes = require('./routes/audio');
 
 const app = express();
 const server = http.createServer(app);
 
+// Allowed CORS origins
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://164.92.67.176:5173',
+  'https://gescall.balenthi.com',
+  process.env.CORS_ORIGIN,
+].filter(Boolean);
+
+// CORS origin validation function
+const corsOrigin = (origin, callback) => {
+  // Allow requests with no origin (like mobile apps or curl)
+  if (!origin) return callback(null, true);
+
+  if (allowedOrigins.includes(origin)) {
+    callback(null, origin);
+  } else {
+    console.log('[CORS] Blocked origin:', origin);
+    callback(null, false);
+  }
+};
+
 // Configure Socket.IO with CORS
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+    origin: corsOrigin,
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -29,7 +52,7 @@ const io = new Server(server, {
 
 // Middleware
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+  origin: corsOrigin,
   credentials: true,
 }));
 app.use(express.json());
@@ -60,6 +83,7 @@ app.use('/api/leads', leadsRoutes);
 app.use('/api/campaigns', campaignsRoutes);
 app.use('/api/agents', agentsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/audio', audioRoutes);
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
@@ -158,7 +182,7 @@ io.on('connection', (socket) => {
     const { agent_user } = data;
     try {
       const result = await vicidialApi.getAgentStatus({ agent_user });
-      
+
       socket.emit('agent:status:response', {
         agent_user,
         success: result.success,
@@ -177,7 +201,7 @@ io.on('connection', (socket) => {
   socket.on('list:create', async (data) => {
     try {
       const result = await vicidialApi.addList(data);
-      
+
       socket.emit('list:create:response', {
         success: result.success,
         data: result.data,
@@ -195,7 +219,7 @@ io.on('connection', (socket) => {
     const { list_id } = data;
     try {
       const result = await vicidialApi.getListInfo({ list_id });
-      
+
       socket.emit('list:info:response', {
         list_id,
         success: result.success,

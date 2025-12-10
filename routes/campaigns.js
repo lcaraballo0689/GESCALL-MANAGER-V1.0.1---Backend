@@ -128,6 +128,33 @@ router.post('/:campaign_id/progress', async (req, res) => {
 });
 
 /**
+ * POST /api/campaigns/bulk/status
+ * Get status for multiple campaigns (replacement for Vicibroker campaigns_status)
+ * Body: { campaigns: ['CAMP01', 'CAMP02'] }
+ */
+router.post('/bulk/status', async (req, res) => {
+  try {
+    const { campaigns } = req.body;
+
+    // campaigns can be empty to get all
+    const data = await databaseService.getCampaignsStatus(
+      campaigns && campaigns.length > 0 ? campaigns : null
+    );
+
+    res.json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error('[Campaigns Bulk Status] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
  * POST /api/campaigns/bulk/lists-count
  * Get lists count for multiple campaigns (using direct DB)
  * Body: { campaigns: ['CAMP01', 'CAMP02'] }

@@ -1,6 +1,57 @@
 const express = require('express');
 const router = express.Router();
 const vicidialApi = require('../services/vicidialApi');
+const databaseService = require('../services/databaseService');
+
+/**
+ * GET /api/lists/next-id
+ * Get the next available list ID
+ */
+router.get('/next-id', async (req, res) => {
+  try {
+    const nextId = await databaseService.getNextListId();
+    res.json({
+      success: true,
+      next_id: nextId,
+    });
+  } catch (error) {
+    console.error('[Lists Next ID] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/lists/:list_id/leads
+ * Get leads for a specific list with pagination
+ */
+router.get('/:list_id/leads', async (req, res) => {
+  try {
+    const { list_id } = req.params;
+    const { limit = 100, offset = 0 } = req.query;
+
+    const [leads, total] = await Promise.all([
+      databaseService.getLeadsByListId(list_id, parseInt(limit), parseInt(offset)),
+      databaseService.getLeadsCountByListId(list_id)
+    ]);
+
+    res.json({
+      success: true,
+      data: leads,
+      total,
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
+  } catch (error) {
+    console.error('[Lists Leads] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
 
 /**
  * GET /api/lists/:list_id
@@ -64,7 +115,8 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const result = await vicidialApi.addList({
+    // Build options object, filtering out undefined/null values
+    const rawOptions = {
       list_id,
       list_name,
       campaign_id,
@@ -74,7 +126,14 @@ router.post('/', async (req, res) => {
       script,
       web_form_address,
       ...otherOptions,
-    });
+    };
+
+    // Remove all undefined, null, or empty string values
+    const options = Object.fromEntries(
+      Object.entries(rawOptions).filter(([_, v]) => v !== undefined && v !== null && v !== '')
+    );
+
+    const result = await vicidialApi.addList(options);
 
     if (result.success) {
       res.json({

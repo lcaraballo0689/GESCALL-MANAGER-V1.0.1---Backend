@@ -369,6 +369,20 @@ class DatabaseService {
   }
 
   /**
+   * Get the next available list ID (max + 1)
+   * @returns {Promise<number>}
+   */
+  async getNextListId() {
+    const sql = `
+      SELECT COALESCE(MAX(list_id), 0) + 1 as next_id
+      FROM vicidial_lists
+    `;
+
+    const results = await database.query(sql);
+    return results[0]?.next_id || 1;
+  }
+
+  /**
    * Get lists by campaign
    * @param {string} campaignId - Campaign ID
    * @returns {Promise<Array>}
@@ -617,6 +631,114 @@ class DatabaseService {
     `;
 
     const params = campaigns && campaigns.length > 0 ? campaigns : [];
+    return await database.query(sql, params);
+  }
+
+  /**
+   * Get leads by list ID with pagination
+   * @param {string} listId - List ID
+   * @param {number} limit - Max rows to return
+   * @param {number} offset - Offset for pagination
+   * @returns {Promise<Array>}
+   */
+  async getLeadsByListId(listId, limit = 100, offset = 0) {
+    const sql = `
+      SELECT
+        vl.lead_id,
+        vl.phone_number,
+        vl.vendor_lead_code,
+        vl.status,
+        vl.first_name,
+        vl.last_name,
+        vl.called_count,
+        vl.last_local_call_time,
+        vl.entry_date,
+        vl.modify_date
+      FROM vicidial_list vl
+      WHERE vl.list_id = ?
+      ORDER BY vl.lead_id DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    return await database.query(sql, [listId, limit, offset]);
+  }
+
+  /**
+   * Get total leads count for a list
+   * @param {string} listId - List ID
+   * @returns {Promise<number>}
+   */
+  async getLeadsCountByListId(listId) {
+    const sql = `
+      SELECT COUNT(*) as total
+      FROM vicidial_list
+      WHERE list_id = ?
+    `;
+
+    const results = await database.query(sql, [listId]);
+    return results[0]?.total || 0;
+  }
+
+  /**
+   * Get campaigns status (replacement for Vicibroker campaigns_status)
+   * @param {string[]} campaigns - Array of campaign IDs
+   * @returns {Promise<Array>}
+   */
+  async getCampaignsStatus(campaigns) {
+    let sql = `
+      SELECT 
+        c.campaign_id,
+        c.campaign_name,
+        c.active,
+        c.dial_method,
+        c.dial_status_a as dial_status,
+        c.lead_order,
+        c.hopper_level,
+        c.auto_dial_level,
+        CASE 
+          WHEN c.active = 'Y' THEN 'Activa'
+          WHEN c.active = 'N' THEN 'Inactiva'
+          ELSE 'Pausada'
+        END as estado
+      FROM vicidial_campaigns c
+    `;
+
+    let params = [];
+    if (campaigns && campaigns.length > 0) {
+      const placeholders = campaigns.map(() => '?').join(',');
+      sql += ` WHERE c.campaign_id IN (${placeholders})`;
+      params = campaigns;
+    }
+
+    sql += ' ORDER BY c.campaign_name';
+
+    return await database.query(sql, params);
+  }
+
+  /**
+   * Get lists count by campaign (replacement for Vicibroker lists_count_by_campaign)
+   * @param {string[]} campaigns - Array of campaign IDs
+   * @returns {Promise<Array>}
+   */
+  async getListsCountByCampaign(campaigns) {
+    let sql = `
+      SELECT 
+        vls.campaign_id,
+        COUNT(DISTINCT vls.list_id) as cantidad_listas,
+        SUM(CASE WHEN vl.lead_id IS NOT NULL THEN 1 ELSE 0 END) as total_leads
+      FROM vicidial_lists vls
+      LEFT JOIN vicidial_list vl ON vls.list_id = vl.list_id
+    `;
+
+    let params = [];
+    if (campaigns && campaigns.length > 0) {
+      const placeholders = campaigns.map(() => '?').join(',');
+      sql += ` WHERE vls.campaign_id IN (${placeholders})`;
+      params = campaigns;
+    }
+
+    sql += ' GROUP BY vls.campaign_id';
+
     return await database.query(sql, params);
   }
 }
