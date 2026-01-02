@@ -344,6 +344,76 @@ class DatabaseService {
   }
 
   /**
+   * Get multiple campaigns by IDs
+   * @param {string[]} campaignIds - Array of campaign IDs
+   * @returns {Promise<Array>}
+   */
+  async getCampaignsByIds(campaignIds) {
+    if (!campaignIds || campaignIds.length === 0) {
+      return [];
+    }
+
+    const placeholders = campaignIds.map(() => '?').join(',');
+    const sql = `
+      SELECT
+        campaign_id,
+        campaign_name,
+        campaign_description,
+        active,
+        dial_method,
+        auto_dial_level,
+        dial_timeout,
+        dial_prefix,
+        campaign_cid,
+        park_ext,
+        park_file_name,
+        web_form_address,
+        allow_closers,
+        hopper_level,
+        auto_alt_dial,
+        use_internal_dnc,
+        use_campaign_dnc,
+        lead_order,
+        lead_filter_id
+      FROM vicidial_campaigns
+      WHERE campaign_id IN (${placeholders})
+      ORDER BY campaign_id
+    `;
+
+    return await database.query(sql, campaignIds);
+  }
+
+  /**
+   * Update campaign status (active field)
+   * @param {string} campaignId
+   * @param {string} status - 'Y' for active, 'N' for inactive
+   * @returns {Promise<Object>}
+   */
+  async updateCampaignStatus(campaignId, status) {
+    const sql = `UPDATE vicidial_campaigns SET active = ? WHERE campaign_id = ?`;
+    const result = await database.query(sql, [status, campaignId]);
+    return { success: true, affectedRows: result.affectedRows };
+  }
+
+  /**
+   * Start a campaign (set active = 'Y')
+   * @param {string} campaignId
+   * @returns {Promise<Object>}
+   */
+  async startCampaign(campaignId) {
+    return this.updateCampaignStatus(campaignId, 'Y');
+  }
+
+  /**
+   * Stop a campaign (set active = 'N')
+   * @param {string} campaignId
+   * @returns {Promise<Object>}
+   */
+  async stopCampaign(campaignId) {
+    return this.updateCampaignStatus(campaignId, 'N');
+  }
+
+  /**
    * Get all lists
    * @returns {Promise<Array>}
    */
@@ -590,6 +660,17 @@ class DatabaseService {
    * @returns {Promise<Array>}
    */
   async getCampaignsSummary(campaigns = null) {
+
+
+    const params = campaigns && campaigns.length > 0 ? campaigns : [];
+
+    // Security Fix: If campaigns argument is provided (as array) but empty, 
+    // it means "filter by these IDs" (which are none), so return nothing.
+    // We only return "All" if campaigns is null/undefined (legacy behavior)
+    if (campaigns && Array.isArray(campaigns) && campaigns.length === 0) {
+      return [];
+    }
+
     const sql = `
       SELECT
         vc.campaign_id,
@@ -630,7 +711,6 @@ class DatabaseService {
       ORDER BY vc.campaign_name
     `;
 
-    const params = campaigns && campaigns.length > 0 ? campaigns : [];
     return await database.query(sql, params);
   }
 
@@ -685,6 +765,12 @@ class DatabaseService {
    * @returns {Promise<Array>}
    */
   async getCampaignsStatus(campaigns) {
+    // Security Fix: If campaigns argument is provided (as array) but empty, 
+    // it means "filter by these IDs" (which are none), so return nothing.
+    if (campaigns && Array.isArray(campaigns) && campaigns.length === 0) {
+      return [];
+    }
+
     let sql = `
       SELECT 
         c.campaign_id,
@@ -721,6 +807,12 @@ class DatabaseService {
    * @returns {Promise<Array>}
    */
   async getListsCountByCampaign(campaigns) {
+    // Security Fix: If campaigns argument is provided (as array) but empty, 
+    // it means "filter by these IDs" (which are none), so return nothing.
+    if (campaigns && Array.isArray(campaigns) && campaigns.length === 0) {
+      return [];
+    }
+
     let sql = `
       SELECT 
         vls.campaign_id,
@@ -740,6 +832,715 @@ class DatabaseService {
     sql += ' GROUP BY vls.campaign_id';
 
     return await database.query(sql, params);
+  }
+
+  /**
+   * Get DNC (Duplicate Number Check / Blacklist) list with pagination and search
+   * @param {number} limit - Max rows to return
+   * @param {number} offset - Offset for pagination
+   * @param {string} search - Search term (phone number)
+   * @returns {Promise<Array>}
+   */
+  async getDncList(limit = 100, offset = 0, search = '') {
+    let sql = 'SELECT phone_number FROM vicidial_dnc';
+    let countSql = 'SELECT COUNT(*) as total FROM vicidial_dnc';
+    let params = [];
+    let countParams = [];
+
+    if (search) {
+      sql += ' WHERE phone_number LIKE ?';
+      countSql += ' WHERE phone_number LIKE ?';
+      params.push(`%${search}%`);
+      countParams.push(`%${search}%`);
+    }
+
+    sql += ' ORDER BY phone_number DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+
+    const rows = await database.query(sql, params);
+    const countResult = await database.query(countSql, countParams);
+
+    return {
+      data: rows || [],
+      total: countResult[0]?.total || 0
+    };
+  }
+
+  /**
+   * Add number to DNC list
+   * @param {string} phoneNumber - Phone number to add
+   * @param {string} campaignId - Optional: Campaign ID (default to global/empty for standard DNC)
+   * @returns {Promise<Object>}
+   */
+  async addDncNumber(phoneNumber, campaignId = '') {
+    // 1. Add to vicidial_dnc (global DNC list)
+    const sql = `
+      INSERT IGNORE INTO vicidial_dnc (phone_number)
+      VALUES (?)
+    `;
+    await database.query(sql, [phoneNumber]);
+
+    // 2. Remove any leads with this phone number from the hopper (via lead_id)
+    // vicidial_hopper only has lead_id, so we need to find leads by phone first
+    const removeHopperSql = `
+      DELETE FROM vicidial_hopper 
+      WHERE lead_id IN (
+        SELECT lead_id FROM vicidial_list WHERE phone_number = ?
+      )
+    `;
+    const hopperResult = await database.query(removeHopperSql, [phoneNumber]);
+    console.log(`[DNC] Removed ${hopperResult.affectedRows || 0} entries from hopper for ${phoneNumber}`);
+
+    // 3. Update all leads with this phone to DNCC status (Do Not Call - Blacklisted)
+    const updateLeadsSql = `
+      UPDATE vicidial_list 
+      SET status = 'DNCC', 
+          called_since_last_reset = 'Y'
+      WHERE phone_number = ?
+    `;
+    const leadsResult = await database.query(updateLeadsSql, [phoneNumber]);
+    console.log(`[DNC] Updated ${leadsResult.affectedRows || 0} leads to DNCC status for ${phoneNumber}`);
+
+    return {
+      success: true,
+      removedFromHopper: hopperResult.affectedRows || 0,
+      leadsUpdated: leadsResult.affectedRows || 0
+    };
+  }
+
+  /**
+   * Remove number from DNC list
+   * @param {string} phoneNumber - Phone number to remove
+   * @returns {Promise<Object>}
+   */
+  async removeDncNumber(phoneNumber) {
+    // 1. Remove from vicidial_dnc
+    const sql = 'DELETE FROM vicidial_dnc WHERE phone_number = ?';
+    await database.query(sql, [phoneNumber]);
+
+    // 2. Restore leads with this phone to NEW status so they can be called again
+    const restoreLeadsSql = `
+      UPDATE vicidial_list 
+      SET status = 'NEW', 
+          called_since_last_reset = 'N'
+      WHERE phone_number = ? AND status = 'DNCC'
+    `;
+    const leadsResult = await database.query(restoreLeadsSql, [phoneNumber]);
+    console.log(`[DNC] Restored ${leadsResult.affectedRows || 0} leads to NEW status for ${phoneNumber}`);
+
+    return {
+      success: true,
+      leadsRestored: leadsResult.affectedRows || 0
+    };
+  }
+
+  /**
+   * Clear all numbers from DNC list
+   * @returns {Promise<Object>}
+   */
+  async clearAllDncNumbers() {
+    const countSql = 'SELECT COUNT(*) as total FROM vicidial_dnc';
+    const countResult = await database.query(countSql, []);
+    const total = countResult[0]?.total || 0;
+
+    const sql = 'DELETE FROM vicidial_dnc';
+    await database.query(sql, []);
+
+    return { success: true, deleted: total };
+  }
+
+  /**
+   * Bulk add numbers to DNC list
+   * @param {Array<string>} numbers - Array of phone numbers
+   * @returns {Promise<Object>}
+   */
+  async bulkAddDncNumbers(numbers) {
+    if (!numbers || numbers.length === 0) return { success: true, count: 0 };
+
+    // MariaDB/mysql2 execute() doesn't support VALUES ? for bulk insert
+    // Build explicit placeholders: INSERT IGNORE INTO ... VALUES (?), (?), (?)
+    const placeholders = numbers.map(() => '(?)').join(', ');
+    const sql = `INSERT IGNORE INTO vicidial_dnc (phone_number) VALUES ${placeholders}`;
+
+    const result = await database.query(sql, numbers);
+    return {
+      success: true,
+      count: result.affectedRows,
+      total: numbers.length
+    };
+  }
+
+  // ==================== WHITELIST PREFIX METHODS ====================
+
+  /**
+   * Get whitelist prefixes with pagination
+   * @param {number} limit - Max results
+   * @param {number} offset - Offset for pagination
+   * @param {string} search - Search term
+   * @returns {Promise<Object>}
+   */
+  async getWhitelistPrefixes(limit = 50, offset = 0, search = '') {
+    let sql = 'SELECT * FROM gescall_whitelist_prefixes';
+    let countSql = 'SELECT COUNT(*) as total FROM gescall_whitelist_prefixes';
+    const params = [];
+    const countParams = [];
+
+    if (search) {
+      sql += ' WHERE prefix LIKE ? OR description LIKE ?';
+      countSql += ' WHERE prefix LIKE ? OR description LIKE ?';
+      const searchParam = `%${search}%`;
+      params.push(searchParam, searchParam);
+      countParams.push(searchParam, searchParam);
+    }
+
+    // MariaDB doesn't support ? placeholders for LIMIT/OFFSET, use direct values
+    const safeLimit = parseInt(limit) || 50;
+    const safeOffset = parseInt(offset) || 0;
+    sql += ` ORDER BY prefix ASC LIMIT ${safeLimit} OFFSET ${safeOffset}`;
+
+    const rows = await database.query(sql, params);
+    const countResult = await database.query(countSql, countParams);
+
+    return {
+      data: rows,
+      total: countResult[0]?.total || 0
+    };
+  }
+
+  /**
+   * Add a new whitelist prefix
+   * @param {string} prefix - 3-digit prefix
+   * @param {string} description - Optional description
+   * @returns {Promise<Object>}
+   */
+  async addWhitelistPrefix(prefix, description = '') {
+    const sql = 'INSERT INTO gescall_whitelist_prefixes (prefix, description) VALUES (?, ?)';
+    const result = await database.query(sql, [prefix, description]);
+    return { success: true, id: result.insertId };
+  }
+
+  /**
+   * Update a whitelist prefix
+   * @param {number} id - Prefix ID
+   * @param {Object} data - Fields to update
+   * @returns {Promise<Object>}
+   */
+  async updateWhitelistPrefix(id, data) {
+    const fields = [];
+    const params = [];
+
+    if (data.prefix !== undefined) {
+      fields.push('prefix = ?');
+      params.push(data.prefix);
+    }
+    if (data.description !== undefined) {
+      fields.push('description = ?');
+      params.push(data.description);
+    }
+    if (data.is_active !== undefined) {
+      fields.push('is_active = ?');
+      params.push(data.is_active ? 1 : 0);
+    }
+
+    if (fields.length === 0) return { success: false, message: 'No fields to update' };
+
+    params.push(id);
+    const sql = `UPDATE gescall_whitelist_prefixes SET ${fields.join(', ')} WHERE id = ?`;
+    await database.query(sql, params);
+    return { success: true };
+  }
+
+  /**
+   * Delete a whitelist prefix
+   * @param {number} id - Prefix ID
+   * @returns {Promise<Object>}
+   */
+  async deleteWhitelistPrefix(id) {
+    const sql = 'DELETE FROM gescall_whitelist_prefixes WHERE id = ?';
+    await database.query(sql, [id]);
+    return { success: true };
+  }
+
+  /**
+   * Validate if a phone number matches an active whitelist prefix
+   * @param {string} phoneNumber - 10-digit phone number
+   * @returns {Promise<Object>}
+   */
+  async validateWhitelistNumber(phoneNumber) {
+    if (!phoneNumber || phoneNumber.length < 3) {
+      return { valid: false, message: 'Invalid phone number' };
+    }
+
+    const prefix = phoneNumber.substring(0, 3);
+    const sql = 'SELECT * FROM gescall_whitelist_prefixes WHERE prefix = ? AND is_active = 1';
+    const rows = await database.query(sql, [prefix]);
+
+    if (rows.length > 0) {
+      return { valid: true, prefix: rows[0] };
+    }
+    return { valid: false, message: `Prefix ${prefix} not in whitelist` };
+  }
+
+  /**
+   * Apply whitelist filter - remove non-matching leads from hopper
+   * and mark them with WLFLTR status
+   * Process in batches to avoid timeouts
+   */
+  async applyWhitelistFilter() {
+    // Get all active whitelist prefixes
+    const prefixes = await database.query(
+      'SELECT prefix FROM gescall_whitelist_prefixes WHERE is_active = 1'
+    );
+
+    if (prefixes.length === 0) {
+      return {
+        success: false,
+        message: 'No hay prefijos activos en la lista blanca. Agregue al menos un prefijo primero.'
+      };
+    }
+
+    // Build the LIKE conditions for matching prefixes
+    const prefixList = prefixes.map(p => p.prefix);
+    const likeConditions = prefixList.map(p => `phone_number LIKE '${p}%'`).join(' OR ');
+    const likeConditionsWithAlias = prefixList.map(p => `l.phone_number LIKE '${p}%'`).join(' OR ');
+
+    let removedFromHopper = 0;
+    let leadsFiltered = 0;
+
+    // Step 1: Remove non-matching leads from hopper
+    const findHopperLeadsSql = `
+      SELECT h.lead_id 
+      FROM vicidial_hopper h
+      JOIN vicidial_list l ON h.lead_id = l.lead_id
+      WHERE NOT (${likeConditionsWithAlias})
+      LIMIT 5000
+    `;
+    const hopperLeadsToRemove = await database.query(findHopperLeadsSql);
+
+    if (hopperLeadsToRemove.length > 0) {
+      const hopperLeadIds = hopperLeadsToRemove.map(l => l.lead_id);
+      const hopperPlaceholders = hopperLeadIds.map(() => '?').join(',');
+
+      const removeHopperSql = `DELETE FROM vicidial_hopper WHERE lead_id IN (${hopperPlaceholders})`;
+      const hopperResult = await database.query(removeHopperSql, hopperLeadIds);
+      removedFromHopper = hopperResult.affectedRows || 0;
+      console.log(`[Whitelist] Removed ${removedFromHopper} leads from hopper`);
+    }
+
+    // Step 2: Mark all non-matching NEW/QUEUE leads as WLFLTR (batch of 5000)
+    const markFilteredSql = `
+      UPDATE vicidial_list 
+      SET status = 'WLFLTR', called_since_last_reset = 'Y'
+      WHERE NOT (${likeConditions})
+        AND status IN ('NEW', 'QUEUE')
+      LIMIT 5000
+    `;
+    const filterResult = await database.query(markFilteredSql);
+    leadsFiltered = filterResult.affectedRows || 0;
+    console.log(`[Whitelist] Marked ${leadsFiltered} leads as filtered`);
+
+    // Check if there are more leads to process
+    const remainingCheck = await database.query(`
+      SELECT COUNT(*) as remaining FROM vicidial_list 
+      WHERE NOT (${likeConditions}) AND status IN ('NEW', 'QUEUE')
+      LIMIT 1
+    `);
+    const remaining = remainingCheck[0]?.remaining || 0;
+
+    return {
+      success: true,
+      prefixesApplied: prefixList,
+      removedFromHopper,
+      leadsFiltered,
+      remainingLeads: remaining,
+      message: remaining > 0 ? `Quedan ${remaining} leads por procesar. Ejecute nuevamente.` : 'Filtro aplicado completamente.'
+    };
+  }
+
+  /**
+   * Clear whitelist filter - restore all WLFLTR leads to NEW status
+   */
+  async clearWhitelistFilter() {
+    // Restore all WLFLTR leads to NEW status
+    const restoreSql = `
+      UPDATE vicidial_list 
+      SET status = 'NEW', 
+          called_since_last_reset = 'N'
+      WHERE status = 'WLFLTR'
+    `;
+    const result = await database.query(restoreSql);
+    console.log(`[Whitelist] Restored ${result.affectedRows || 0} leads to NEW status`);
+
+    return {
+      success: true,
+      leadsRestored: result.affectedRows || 0
+    };
+  }
+
+  // ==================== CALLERID POOLS METHODS ====================
+
+  /**
+   * Get all CallerID pools with stats
+   */
+  async getCallerIdPools(limit = 50, offset = 0, search = '') {
+    let sql = `
+      SELECT p.*, 
+        COUNT(DISTINCT n.id) as total_numbers,
+        SUM(CASE WHEN n.is_active = 1 THEN 1 ELSE 0 END) as active_numbers
+      FROM gescall_callerid_pools p
+      LEFT JOIN gescall_callerid_pool_numbers n ON p.id = n.pool_id
+    `;
+    let countSql = 'SELECT COUNT(*) as total FROM gescall_callerid_pools';
+    const params = [];
+    const countParams = [];
+
+    if (search) {
+      sql += ' WHERE p.name LIKE ? OR p.description LIKE ?';
+      countSql += ' WHERE name LIKE ? OR description LIKE ?';
+      const searchParam = `%${search}%`;
+      params.push(searchParam, searchParam);
+      countParams.push(searchParam, searchParam);
+    }
+
+    sql += ' GROUP BY p.id ORDER BY p.name ASC';
+    const safeLimit = parseInt(limit) || 50;
+    const safeOffset = parseInt(offset) || 0;
+    sql += ` LIMIT ${safeLimit} OFFSET ${safeOffset}`;
+
+    const rows = await database.query(sql, params);
+    const countResult = await database.query(countSql, countParams);
+
+    return { data: rows, total: countResult[0]?.total || 0 };
+  }
+
+  /**
+   * Get a single CallerID pool by ID
+   */
+  async getCallerIdPoolById(id) {
+    const sql = `
+      SELECT p.*, 
+        COUNT(DISTINCT n.id) as total_numbers,
+        SUM(CASE WHEN n.is_active = 1 THEN 1 ELSE 0 END) as active_numbers
+      FROM gescall_callerid_pools p
+      LEFT JOIN gescall_callerid_pool_numbers n ON p.id = n.pool_id
+      WHERE p.id = ?
+      GROUP BY p.id
+    `;
+    const rows = await database.query(sql, [id]);
+    return rows[0] || null;
+  }
+
+  /**
+   * Create a new CallerID pool
+   */
+  async createCallerIdPool(name, description, countryCode = 'CO') {
+    const sql = 'INSERT INTO gescall_callerid_pools (name, description, country_code) VALUES (?, ?, ?)';
+    const result = await database.query(sql, [name, description, countryCode]);
+    return { success: true, id: result.insertId };
+  }
+
+  /**
+   * Update a CallerID pool
+   */
+  async updateCallerIdPool(id, data) {
+    const fields = [];
+    const params = [];
+
+    if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name); }
+    if (data.description !== undefined) { fields.push('description = ?'); params.push(data.description); }
+    if (data.country_code !== undefined) { fields.push('country_code = ?'); params.push(data.country_code); }
+    if (data.is_active !== undefined) { fields.push('is_active = ?'); params.push(data.is_active ? 1 : 0); }
+
+    if (fields.length === 0) return { success: false, message: 'No fields to update' };
+
+    params.push(id);
+    const sql = `UPDATE gescall_callerid_pools SET ${fields.join(', ')} WHERE id = ?`;
+    await database.query(sql, params);
+    return { success: true };
+  }
+
+  /**
+   * Delete a CallerID pool
+   */
+  async deleteCallerIdPool(id) {
+    const sql = 'DELETE FROM gescall_callerid_pools WHERE id = ?';
+    await database.query(sql, [id]);
+    return { success: true };
+  }
+
+  // ==================== CALLERID POOL NUMBERS METHODS ====================
+
+  /**
+   * Get numbers in a pool
+   */
+  async getPoolNumbers(poolId, limit = 100, offset = 0, search = '') {
+    let sql = 'SELECT * FROM gescall_callerid_pool_numbers WHERE pool_id = ?';
+    let countSql = 'SELECT COUNT(*) as total FROM gescall_callerid_pool_numbers WHERE pool_id = ?';
+    const params = [poolId];
+    const countParams = [poolId];
+
+    if (search) {
+      sql += ' AND (callerid LIKE ? OR area_code LIKE ?)';
+      countSql += ' AND (callerid LIKE ? OR area_code LIKE ?)';
+      const searchParam = `%${search}%`;
+      params.push(searchParam, searchParam);
+      countParams.push(searchParam, searchParam);
+    }
+
+    const safeLimit = parseInt(limit) || 100;
+    const safeOffset = parseInt(offset) || 0;
+    sql += ` ORDER BY area_code, callerid LIMIT ${safeLimit} OFFSET ${safeOffset}`;
+
+    const rows = await database.query(sql, params);
+    const countResult = await database.query(countSql, countParams);
+
+    return { data: rows, total: countResult[0]?.total || 0 };
+  }
+
+  /**
+   * Add a number to a pool
+   */
+  async addPoolNumber(poolId, callerid) {
+    const areaCode = callerid.substring(0, 3);
+    const sql = 'INSERT INTO gescall_callerid_pool_numbers (pool_id, callerid, area_code) VALUES (?, ?, ?)';
+    const result = await database.query(sql, [poolId, callerid, areaCode]);
+    return { success: true, id: result.insertId };
+  }
+
+  /**
+   * Bulk add numbers to a pool
+   */
+  async bulkAddPoolNumbers(poolId, numbers) {
+    if (!numbers || numbers.length === 0) return { success: true, count: 0 };
+
+    // Build INSERT IGNORE with explicit placeholders
+    const values = numbers.map(num => {
+      const areaCode = num.substring(0, 3);
+      return [poolId, num, areaCode];
+    });
+
+    const placeholders = values.map(() => '(?, ?, ?)').join(', ');
+    const flatParams = values.flat();
+    const sql = `INSERT IGNORE INTO gescall_callerid_pool_numbers (pool_id, callerid, area_code) VALUES ${placeholders}`;
+
+    const result = await database.query(sql, flatParams);
+    return { success: true, count: result.affectedRows, total: numbers.length };
+  }
+
+  /**
+   * Delete a number from a pool
+   */
+  async deletePoolNumber(numberId) {
+    const sql = 'DELETE FROM gescall_callerid_pool_numbers WHERE id = ?';
+    await database.query(sql, [numberId]);
+    return { success: true };
+  }
+
+  /**
+   * Toggle number active status
+   */
+  async togglePoolNumber(numberId, isActive) {
+    const sql = 'UPDATE gescall_callerid_pool_numbers SET is_active = ? WHERE id = ?';
+    await database.query(sql, [isActive ? 1 : 0, numberId]);
+    return { success: true };
+  }
+
+  // ==================== CAMPAIGN CALLERID SETTINGS ====================
+
+  /**
+   * Get campaign CallerID settings
+   */
+  async getCampaignCallerIdSettings(campaignId) {
+    const sql = `
+      SELECT s.*, p.name as pool_name
+      FROM gescall_campaign_callerid_settings s
+      LEFT JOIN gescall_callerid_pools p ON s.pool_id = p.id
+      WHERE s.campaign_id = ?
+    `;
+    const rows = await database.query(sql, [campaignId]);
+    return rows[0] || null;
+  }
+
+  /**
+   * Upsert campaign CallerID settings
+   */
+  async upsertCampaignCallerIdSettings(campaignId, data) {
+    const sql = `
+      INSERT INTO gescall_campaign_callerid_settings 
+        (campaign_id, rotation_mode, pool_id, match_mode, fixed_area_code, fallback_callerid, selection_strategy)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        rotation_mode = VALUES(rotation_mode),
+        pool_id = VALUES(pool_id),
+        match_mode = VALUES(match_mode),
+        fixed_area_code = VALUES(fixed_area_code),
+        fallback_callerid = VALUES(fallback_callerid),
+        selection_strategy = VALUES(selection_strategy)
+    `;
+    await database.query(sql, [
+      campaignId,
+      data.rotation_mode || 'OFF',
+      data.pool_id || null,
+      data.match_mode || 'LEAD',
+      data.fixed_area_code || null,
+      data.fallback_callerid || null,
+      data.selection_strategy || 'ROUND_ROBIN'
+    ]);
+    return { success: true };
+  }
+
+  // ==================== CALLERID SELECTION LOGIC ====================
+
+  /**
+   * Select the best CallerID for a call
+   * @param {string} campaignId
+   * @param {string} leadPhoneNumber
+   * @returns {Promise<Object>} { callerid, selection_result, area_code_target }
+   */
+  async selectCallerIdForCall(campaignId, leadPhoneNumber) {
+    // Get campaign settings
+    const settings = await this.getCampaignCallerIdSettings(campaignId);
+
+    if (!settings || settings.rotation_mode === 'OFF') {
+      return { callerid: null, selection_result: 'DEFAULT', area_code_target: null };
+    }
+
+    // Determine target area code
+    let areaCodeTarget;
+    if (settings.match_mode === 'FIXED') {
+      areaCodeTarget = settings.fixed_area_code;
+    } else {
+      // Extract from lead phone (first 3 digits)
+      const cleanPhone = leadPhoneNumber.replace(/[^0-9]/g, '');
+      areaCodeTarget = cleanPhone.substring(0, 3);
+    }
+
+    // Select CallerID based on strategy
+    let callerid = null;
+    const poolId = settings.pool_id;
+
+    if (settings.selection_strategy === 'RANDOM') {
+      const sql = `
+        SELECT * FROM gescall_callerid_pool_numbers 
+        WHERE pool_id = ? AND area_code = ? AND is_active = 1
+        ORDER BY RAND() LIMIT 1
+      `;
+      const rows = await database.query(sql, [poolId, areaCodeTarget]);
+      if (rows.length > 0) callerid = rows[0].callerid;
+
+    } else if (settings.selection_strategy === 'LRU') {
+      const sql = `
+        SELECT * FROM gescall_callerid_pool_numbers 
+        WHERE pool_id = ? AND area_code = ? AND is_active = 1
+        ORDER BY last_used_at ASC, id ASC LIMIT 1
+      `;
+      const rows = await database.query(sql, [poolId, areaCodeTarget]);
+      if (rows.length > 0) callerid = rows[0].callerid;
+
+    } else {
+      // Round-robin (default)
+      const sql = `
+        SELECT * FROM gescall_callerid_pool_numbers 
+        WHERE pool_id = ? AND area_code = ? AND is_active = 1
+        ORDER BY rr_order ASC, id ASC LIMIT 1
+      `;
+      const rows = await database.query(sql, [poolId, areaCodeTarget]);
+      if (rows.length > 0) {
+        callerid = rows[0].callerid;
+        // Update round-robin order
+        const maxOrderSql = 'SELECT MAX(rr_order) as max_order FROM gescall_callerid_pool_numbers WHERE pool_id = ? AND area_code = ?';
+        const maxResult = await database.query(maxOrderSql, [poolId, areaCodeTarget]);
+        const newOrder = (maxResult[0]?.max_order || 0) + 1;
+        await database.query('UPDATE gescall_callerid_pool_numbers SET rr_order = ?, last_used_at = NOW(), use_count = use_count + 1 WHERE id = ?', [newOrder, rows[0].id]);
+      }
+    }
+
+    // If no match, use fallback
+    if (!callerid && settings.fallback_callerid) {
+      return { callerid: settings.fallback_callerid, selection_result: 'FALLBACK', area_code_target: areaCodeTarget };
+    }
+
+    if (!callerid) {
+      return { callerid: null, selection_result: 'DEFAULT', area_code_target: areaCodeTarget };
+    }
+
+    // Update usage stats if not round-robin (already updated above)
+    if (settings.selection_strategy !== 'ROUND_ROBIN') {
+      await database.query('UPDATE gescall_callerid_pool_numbers SET last_used_at = NOW(), use_count = use_count + 1 WHERE pool_id = ? AND callerid = ?', [poolId, callerid]);
+    }
+
+    return { callerid, selection_result: 'MATCHED', area_code_target: areaCodeTarget };
+  }
+
+  /**
+   * Log CallerID usage
+   */
+  async logCallerIdUsage(data) {
+    const sql = `
+      INSERT INTO gescall_callerid_usage_log 
+        (campaign_id, lead_id, phone_number, callerid_used, area_code_target, pool_id, selection_result, strategy)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    await database.query(sql, [
+      data.campaign_id,
+      data.lead_id || null,
+      data.phone_number || null,
+      data.callerid_used,
+      data.area_code_target,
+      data.pool_id || null,
+      data.selection_result,
+      data.strategy || null
+    ]);
+    return { success: true };
+  }
+
+  /**
+   * Get CallerID usage logs
+   */
+  async getCallerIdUsageLogs(filters = {}) {
+    let sql = 'SELECT * FROM gescall_callerid_usage_log WHERE 1=1';
+    const params = [];
+
+    if (filters.campaign_id) {
+      sql += ' AND campaign_id = ?';
+      params.push(filters.campaign_id);
+    }
+    if (filters.pool_id) {
+      sql += ' AND pool_id = ?';
+      params.push(filters.pool_id);
+    }
+    if (filters.callerid) {
+      sql += ' AND callerid_used LIKE ?';
+      params.push(`%${filters.callerid}%`);
+    }
+    if (filters.start_date) {
+      sql += ' AND created_at >= ?';
+      params.push(filters.start_date);
+    }
+    if (filters.end_date) {
+      sql += ' AND created_at <= ?';
+      params.push(filters.end_date);
+    }
+
+    const safeLimit = parseInt(filters.limit) || 100;
+    const safeOffset = parseInt(filters.offset) || 0;
+    sql += ` ORDER BY created_at DESC LIMIT ${safeLimit} OFFSET ${safeOffset}`;
+
+    return await database.query(sql, params);
+  }
+
+  /**
+   * Get area codes available in a pool
+   */
+  async getPoolAreaCodes(poolId) {
+    const sql = `
+      SELECT area_code, COUNT(*) as count, SUM(use_count) as total_uses
+      FROM gescall_callerid_pool_numbers
+      WHERE pool_id = ? AND is_active = 1
+      GROUP BY area_code
+      ORDER BY area_code
+    `;
+    return await database.query(sql, [poolId]);
   }
 }
 

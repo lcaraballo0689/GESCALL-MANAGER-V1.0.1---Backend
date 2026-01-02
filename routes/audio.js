@@ -155,8 +155,8 @@ router.get('/', async (req, res) => {
     try {
         // List wav files in sounds directory
         // Use find -printf to get name, size and modified time in one go
-        // Format: filename|size|modified_timestamp
-        const command = `find ${soundsPath} -maxdepth 1 \\( -name "*.wav" -o -name "*.gsm" -o -name "*.mp3" \\) -printf "%f|%s|%T@\\n" | sort -t '|' -k3 -nr | head -200`;
+        // Filter: Only gc_ files, sorted by date DESC, max 200. Follow symlinks (-L)
+        const command = `find -L ${soundsPath} -maxdepth 1 -name "gc_*" -printf "%f|%s|%T@\\n" | sort -t '|' -k3 -nr | head -200`;
 
         console.log('[Audio] Executing list command');
         const output = await sshExec(command);

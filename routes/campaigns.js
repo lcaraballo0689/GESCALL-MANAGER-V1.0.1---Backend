@@ -9,13 +9,26 @@ const databaseService = require('../services/databaseService');
  */
 router.get('/', async (req, res) => {
   try {
-    const { campaign_id } = req.query;
+    const { campaign_id, allowed_campaigns } = req.query;
 
     let data;
     if (campaign_id) {
       data = await databaseService.getCampaignById(campaign_id);
       data = data ? [data] : [];
+    } else if (allowed_campaigns) {
+      // Parse allowed_campaigns if it's a string (e.g. "CAMP1,CAMP2")
+      const allowedIds = typeof allowed_campaigns === 'string'
+        ? allowed_campaigns.split(',').filter(Boolean)
+        : (Array.isArray(allowed_campaigns) ? allowed_campaigns : []);
+
+      if (allowedIds.length > 0) {
+        data = await databaseService.getCampaignsByIds(allowedIds);
+      } else {
+        data = [];
+      }
     } else {
+      // Default: return all campaigns (backward compatibility)
+      // TODO: Consider changing this to return empty array for security
       data = await databaseService.getAllCampaigns();
     }
 
@@ -136,10 +149,9 @@ router.post('/bulk/status', async (req, res) => {
   try {
     const { campaigns } = req.body;
 
-    // campaigns can be empty to get all
-    const data = await databaseService.getCampaignsStatus(
-      campaigns && campaigns.length > 0 ? campaigns : null
-    );
+    // campaigns can be empty (but we should pass it as is to let the service decide)
+    // Sending null would trigger "fetch all", which we want to avoid if user sends explicit empty list
+    const data = await databaseService.getCampaignsStatus(campaigns);
 
     res.json({
       success: true,
@@ -398,6 +410,156 @@ router.post('/summary', async (req, res) => {
       success: false,
       error: error.message,
     });
+  }
+});
+
+// ==================== CAMPAIGN CONTROL ====================
+
+/**
+ * POST /api/campaigns/:campaign_id/start
+ * Start a campaign (set active = 'Y')
+ */
+router.post('/:campaign_id/start', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    console.log(`[Campaign Start] Starting campaign: ${campaign_id}`);
+
+    await databaseService.startCampaign(campaign_id);
+
+    res.json({
+      success: true,
+      message: `Campaña ${campaign_id} iniciada`,
+      status: 'active'
+    });
+  } catch (error) {
+    console.error('[Campaign Start] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/campaigns/:campaign_id/stop
+ * Stop a campaign (set active = 'N')
+ */
+router.post('/:campaign_id/stop', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    console.log(`[Campaign Stop] Stopping campaign: ${campaign_id}`);
+
+    await databaseService.stopCampaign(campaign_id);
+
+    res.json({
+      success: true,
+      message: `Campaña ${campaign_id} detenida`,
+      status: 'inactive'
+    });
+  } catch (error) {
+    console.error('[Campaign Stop] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== CALLERID SETTINGS ====================
+
+/**
+ * GET /api/campaigns/:campaign_id/callerid-settings
+ * Get CallerID rotation settings for a campaign
+ */
+router.get('/:campaign_id/callerid-settings', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const settings = await databaseService.getCampaignCallerIdSettings(campaign_id);
+
+    // Return default settings if none exist
+    const defaultSettings = {
+      campaign_id,
+      rotation_mode: 'OFF',
+      pool_id: null,
+      pool_name: null,
+      match_mode: 'LEAD',
+      fixed_area_code: null,
+      fallback_callerid: null,
+      selection_strategy: 'ROUND_ROBIN'
+    };
+
+    res.json({
+      success: true,
+      data: settings || defaultSettings
+    });
+  } catch (error) {
+    console.error('[Campaign CallerID Settings Get] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * PUT /api/campaigns/:campaign_id/callerid-settings
+ * Update CallerID rotation settings for a campaign
+ */
+router.put('/:campaign_id/callerid-settings', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const { rotation_mode, pool_id, match_mode, fixed_area_code, fallback_callerid, selection_strategy } = req.body;
+
+    await databaseService.upsertCampaignCallerIdSettings(campaign_id, {
+      rotation_mode,
+      pool_id,
+      match_mode,
+      fixed_area_code,
+      fallback_callerid,
+      selection_strategy
+    });
+
+    res.json({ success: true, message: 'Configuración guardada' });
+  } catch (error) {
+    console.error('[Campaign CallerID Settings Update] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/campaigns/:campaign_id/select-callerid
+ * Select a CallerID for an outbound call (used by AGI)
+ * Body: { phone_number, lead_id }
+ */
+router.post('/:campaign_id/select-callerid', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const { phone_number, lead_id } = req.body;
+
+    if (!phone_number) {
+      return res.status(400).json({ success: false, error: 'phone_number is required' });
+    }
+
+    // Select CallerID
+    const result = await databaseService.selectCallerIdForCall(campaign_id, phone_number);
+
+    // Get campaign settings for logging
+    const settings = await databaseService.getCampaignCallerIdSettings(campaign_id);
+
+    // Log usage
+    if (result.callerid) {
+      await databaseService.logCallerIdUsage({
+        campaign_id,
+        lead_id,
+        phone_number,
+        callerid_used: result.callerid,
+        area_code_target: result.area_code_target,
+        pool_id: settings?.pool_id || null,
+        selection_result: result.selection_result,
+        strategy: settings?.selection_strategy || null
+      });
+    }
+
+    res.json({
+      success: true,
+      callerid: result.callerid,
+      selection_result: result.selection_result,
+      area_code_target: result.area_code_target
+    });
+  } catch (error) {
+    console.error('[CallerID Select] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

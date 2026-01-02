@@ -1,5 +1,10 @@
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const config = require('../config/vicidial');
+
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
 class VicidialAPI {
   constructor() {
@@ -24,9 +29,11 @@ class VicidialAPI {
       const url = `${this.baseUrl}?${queryParams.toString()}`;
 
       console.log(`[Vicidial API] Request: ${params.function}`);
-      
+
       const response = await axios.get(url, {
         timeout: 30000,
+        httpAgent,
+        httpsAgent,
       });
 
       return {
@@ -42,6 +49,17 @@ class VicidialAPI {
         data: null,
       };
     }
+  }
+
+  /**
+   * Update list status
+   */
+  async updateListStatus(list_id, active) {
+    return await this.request({
+      function: 'update_list',
+      list_id,
+      active,
+    });
   }
 
   /**

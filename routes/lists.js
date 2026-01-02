@@ -227,4 +227,27 @@ router.delete('/:list_id', async (req, res) => {
   }
 });
 
+// Update list status
+router.patch('/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { active } = req.body;
+
+    if (!['Y', 'N'].includes(active)) {
+      return res.status(400).json({ error: 'Invalid active status. Must be Y or N' });
+    }
+
+    const result = await vicidialApi.updateListStatus(id, active);
+
+    // Also update in local DB if necessary, but VicidialAPI is the source of truth for dialing
+    // If using local mirror:
+    await databaseService.executeQuery('UPDATE vicidial_lists SET active = ? WHERE list_id = ?', [active, id]);
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error updating list status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 module.exports = router;

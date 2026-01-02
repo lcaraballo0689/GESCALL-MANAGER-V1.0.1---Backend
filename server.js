@@ -15,6 +15,11 @@ const campaignsRoutes = require('./routes/campaigns');
 const agentsRoutes = require('./routes/agents');
 const dashboardRoutes = require('./routes/dashboard');
 const audioRoutes = require('./routes/audio');
+const dncRoutes = require('./routes/dnc');
+const whitelistRoutes = require('./routes/whitelist');
+const calleridPoolsRoutes = require('./routes/calleridPools');
+const schedulesRoutes = require('./routes/schedules');
+const schedulerService = require('./services/schedulerService');
 
 const app = express();
 const server = http.createServer(app);
@@ -84,76 +89,181 @@ app.use('/api/campaigns', campaignsRoutes);
 app.use('/api/agents', agentsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/audio', audioRoutes);
+app.use('/api/dnc', dncRoutes);
+app.use('/api/whitelist', whitelistRoutes);
+app.use('/api/callerid-pools', calleridPoolsRoutes);
+app.use('/api/schedules', schedulesRoutes);
+
+// Track active uploads for cancellation
+const activeUploads = new Set();
+const pausedUploads = new Set();
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
   console.log(`[Socket.IO] Client connected: ${socket.id}`);
 
+  // Subscribe to task updates (for reconnection)
+  socket.on('task:subscribe', (taskId) => {
+    if (activeUploads.has(taskId)) {
+      console.log(`[Socket.IO] Client ${socket.id} subscribed to task: ${taskId}`);
+      socket.join(`task:${taskId}`);
+    } else {
+      console.log(`[Socket.IO] Client subscribe rejected (not found): ${taskId}`);
+      socket.emit('task:not_found', { processId: taskId });
+    }
+  });
+
   // Handle lead upload with progress tracking
   socket.on('upload:leads:start', async (data) => {
-    const { leads, list_id, campaign_id } = data;
-    console.log(`[Socket.IO] Starting lead upload: ${leads.length} leads to list ${list_id}`);
+    const { leads, list_id, campaign_id, processId } = data;
+    console.log(`[Socket.IO] Starting lead upload: ${leads.length} leads to list ${list_id} (Process: ${processId})`);
+
+    // Join a room specific to this task
+    socket.join(`task:${processId}`);
 
     let processed = 0;
     let successful = 0;
     let errors = 0;
     const results = [];
 
-    for (const lead of leads) {
-      try {
-        const result = await vicidialApi.addLead({
-          ...lead,
-          list_id,
-        });
+    // Mark upload as active
+    activeUploads.add(processId);
 
-        if (result.success) {
-          successful++;
-          results.push({
-            success: true,
-            phone_number: lead.phone_number,
-            data: result.data,
-          });
-        } else {
-          errors++;
-          results.push({
-            success: false,
-            phone_number: lead.phone_number,
-            error: result.data,
-          });
-        }
-      } catch (error) {
-        errors++;
-        results.push({
-          success: false,
-          phone_number: lead.phone_number,
-          error: error.message,
+    const BATCH_SIZE = 50; // Process 50 leads concurrently
+
+    for (let i = 0; i < leads.length; i += BATCH_SIZE) {
+      // Check for cancellation
+      if (!activeUploads.has(processId)) {
+        console.log(`[Socket.IO] Upload cancelled: ${processId}`);
+        io.to(`task:${processId}`).emit('upload:leads:cancelled', {
+          processId,
+          processed,
+          message: 'Carga cancelada por el usuario'
         });
+        break;
       }
 
-      processed++;
+      // Check for pause
+      while (pausedUploads.has(processId)) {
+        if (!activeUploads.has(processId)) break;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
 
-      // Send progress update
-      socket.emit('upload:leads:progress', {
-        total: leads.length,
-        processed,
-        successful,
-        errors,
-        percentage: Math.round((processed / leads.length) * 100),
+      // If cancelled while paused
+      if (!activeUploads.has(processId)) {
+        io.to(`task:${processId}`).emit('upload:leads:cancelled', {
+          processId,
+          processed,
+          message: 'Carga cancelada por el usuario'
+        });
+        break;
+      }
+
+      // Prepare batch
+      const batch = leads.slice(i, i + BATCH_SIZE);
+
+      const batchPromises = batch.map(async (lead) => {
+        try {
+          const result = await vicidialApi.addLead({
+            ...lead,
+            list_id: list_id,
+            phone_code: '57' // Default Colombia
+          });
+
+          if (result.success) {
+            return { success: true };
+          } else {
+            console.error(`[Lead Upload Error] Phone: ${lead.phone_number}, Error:`, result.data);
+            return { success: false, error: result.data || 'Error desconocido' };
+          }
+        } catch (error) {
+          console.error(`[Lead Upload Exception] Phone: ${lead.phone_number}`, error);
+          return { success: false, error: error.message };
+        }
       });
 
-      // Small delay to avoid overwhelming the API
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Execute batch
+      const batchResults = await Promise.all(batchPromises);
+
+      // Aggregate results
+      let batchSuccess = 0;
+      let batchErrors = 0;
+
+      batchResults.forEach((res, index) => {
+        if (res.success) {
+          batchSuccess++;
+          successful++;
+        } else {
+          batchErrors++;
+          errors++;
+          // Store detailed error for the specific lead in the batch
+          results.push({
+            success: false,
+            phone_number: batch[index].phone_number,
+            error: res.error,
+          });
+        }
+      });
+
+      processed += batch.length;
+
+      // Calculate progress percentage
+      const percentage = Math.round((processed / leads.length) * 100);
+
+      // Emit progress to room
+      io.to(`task:${processId}`).emit('upload:leads:progress', {
+        processId,
+        percentage,
+        processed,
+        total: leads.length,
+        successful,
+        errors
+      });
     }
 
-    // Send completion event
-    socket.emit('upload:leads:complete', {
-      total: leads.length,
-      successful,
-      errors,
-      results,
-    });
+    if (activeUploads.has(processId)) {
+      io.to(`task:${processId}`).emit('upload:leads:complete', {
+        processId,
+        successful,
+        errors,
+        message: 'Carga completada exitosamente'
+      });
+      console.log(`[Socket.IO] Lead upload completed: ${successful} successful, ${errors} errors`);
+      // Cleanup
+      activeUploads.delete(processId);
+      pausedUploads.delete(processId);
+    }
+  });
 
-    console.log(`[Socket.IO] Lead upload completed: ${successful} successful, ${errors} errors`);
+  // Handle cancellation request
+  socket.on('upload:leads:cancel', (data) => {
+    const { processId } = data;
+    if (activeUploads.has(processId)) {
+      console.log(`[Socket.IO] Cancelling upload: ${processId}`);
+      activeUploads.delete(processId);
+      pausedUploads.delete(processId);
+      // The loop will detect this change and break
+    }
+  });
+
+  // Handle pause request
+  socket.on('upload:leads:pause', (data) => {
+    const { processId } = data;
+    if (activeUploads.has(processId)) {
+      console.log(`[Socket.IO] Pausing upload: ${processId}`);
+      pausedUploads.add(processId);
+      io.to(`task:${processId}`).emit('upload:leads:paused', { processId });
+    }
+  });
+
+  // Handle resume request
+  socket.on('upload:leads:resume', (data) => {
+    const { processId } = data;
+    if (activeUploads.has(processId) && pausedUploads.has(processId)) {
+      console.log(`[Socket.IO] Resuming upload: ${processId}`);
+      pausedUploads.delete(processId);
+      io.to(`task:${processId}`).emit('upload:leads:resumed', { processId });
+    }
   });
 
   // Real-time dashboard updates
@@ -300,6 +410,9 @@ server.listen(PORT, () => {
 ║  Vicidial API: ${process.env.VICIDIAL_API_URL ? 'Configured' : 'Not configured'}          ║
 ╚════════════════════════════════════════════╝
   `);
+
+  // Start the scheduler service
+  schedulerService.start();
 });
 
 // Graceful shutdown
